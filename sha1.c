@@ -16,6 +16,7 @@ void sha1(uint64_t n, const uint8_t* message, uint8_t hash[20]) {
 	uint64_t ml = n*8;
 	size_t buffer_size = ((n + 9 + 63) / 64) * 64; // ceil((n + 9) / 64) × 64
 	uint8_t* buffer = malloc(buffer_size);
+    assert(buffer != NULL);
 
 	memcpy(buffer, message, n);
 
@@ -106,18 +107,6 @@ void sha1(uint64_t n, const uint8_t* message, uint8_t hash[20]) {
 		hash[i*4+2] = (uint8_t)(h[i] >> 8);
 		hash[i*4+3] = (uint8_t)(h[i]);
 	}
-}
-
-bool hash_eq(const uint8_t h1[20], const uint8_t h2[20]) {
-	assert(h1 != NULL && h2 != NULL);
-
-	for (int i = 0; i < 20; ++i) {
-		if (h1[i] != h2[i]) {
-			return false;
-		}
-	}
-
-	return true;
 }
 
 void hash_to_string(const uint8_t hash[20], char hash_str[41]) {

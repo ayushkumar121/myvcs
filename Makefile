@@ -1,5 +1,5 @@
 CC=cc
-CFLAGS=-Wall -Wextra -g
+CFLAGS=-Wall -Wextra -g -fsanitize=address
 LIBS=-lz
 
 .PHONY: format clean all

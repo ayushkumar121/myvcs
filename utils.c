@@ -1,6 +1,7 @@
 #include "utils.h"
 
-#include <_string.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 
 void buffer_print(FILE* f, size_t size, void* buffer) {
@@ -145,7 +146,7 @@ char* normalise_path(const char* path) {
 	}
 
 	if (trailing_slash) normalised[offset++] = '/';
-    normalised[offset] = '\0';
+	normalised[offset] = '\0';
 
 	free(crumbs);
 	return normalised;
