@@ -70,7 +70,6 @@ static void myvcs_index_add(Index* index, IndexEntry entry);
 static int myvcs_index_entry_compare(const void* a, const void* b);
 static void myvcs_index_write(Index index);
 static uint32_t mode_from_state(mode_t mode);
-static char* normalise_path(const char* path);
 
 // Zlib helpers
 static Buffer zlib_compress(size_t size, const void* data);
@@ -306,16 +305,23 @@ void myvcs_add_file(Args* args) {
 
 	for (int i = 0; i < file_count; i++) {
 		const char* file_path = file_paths[i];
-	    char* normal_path = normalise_path(file_path);
-	    if (normal_path == NULL) {
-	        fprintf(stderr, "error: could not normalise path '%s'\n", normal_path);
-	        exit(1);
-	    }
 
-	    if (strncmp(normal_path, DATABASE_DIRECTORY, sizeof(DATABASE_DIRECTORY)) == 0) {
-	        fprintf(stderr, "error: cannot add files from '" DATABASE_DIRECTORY "'\n");
-	        exit(1);
-	    }
+		char* normal_path = normalise_path(file_path);
+		if (normal_path == NULL) {
+			fprintf(stderr, "error: could not normalise path '%s'\n", normal_path);
+			exit(1);
+		}
+		fprintf(stderr, "myvcs: normalised path: %s\n", normal_path);
+
+		if (strncmp(normal_path, DATABASE_DIRECTORY, sizeof(DATABASE_DIRECTORY)) == 0) {
+			fprintf(stderr, "error: cannot add files from '" DATABASE_DIRECTORY "'\n");
+			exit(1);
+		}
+
+		if (folder_exists(normal_path)) {
+			fprintf(stderr, "myvcs: adding folder is not supported\n");
+			exit(1);
+		}
 
 		const Object object = myvcs_object_make("blob", normal_path);
 
@@ -702,20 +708,6 @@ uint32_t mode_from_state(mode_t mode) {
 	}
 
 	return 0;
-}
-
-// TODO: do not depend on realpath
-char* normalise_path(const char* path) {
-	char root[PATH_MAX], full[PATH_MAX];
-	if (realpath(".", root) == NULL || realpath(path, full) == NULL) {
-	    return NULL;
-	}
-
-	size_t n = strlen(root);
-	if (strncmp(full, root, n) != 0 || full[n] != '/') {
-	    return NULL;
-	};
-	return strdup(full + n + 1);
 }
 
 Buffer zlib_compress(size_t size, const void* data) {

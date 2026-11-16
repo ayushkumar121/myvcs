@@ -27,4 +27,6 @@ const char* args_next(Args* args);
 bool file_exists(const char* path);
 bool folder_exists(const char* path);
 
+char* normalise_path(const char* path);
+
 #endif
