@@ -27,7 +27,7 @@ enum {
 	FILE_MODE_EXECUTABLE = 0100755,
 	FILE_MODE_SYMLINK = 0120000,
 	FILE_MODE_DIRECTORY = 0040000,
-    FILE_MODE_SUBMODULE = 0160000
+	FILE_MODE_SUBMODULE = 0160000
 };
 
 typedef struct {
@@ -51,21 +51,22 @@ typedef struct {
 	uint32_t count;
 	uint32_t capacity;
 	IndexEntry* entries;
+	uint8_t hash[20];
 } Index;
 
 typedef struct TreeNode TreeNode;
 
 struct TreeNode {
-    size_t size;
-    const char* name;
-    size_t name_length;
-    uint32_t mode;
+	size_t size;
+	const char* name;
+	size_t name_length;
+	uint32_t mode;
 	uint8_t hash[20];
 
 	ARRAY(TreeNode*) children;
 
-    // Serialised object
-    Object object;
+	// Serialised object
+	Object object;
 };
 
 #define EMPTY_INDEX ((Index){.version = 2})
@@ -79,15 +80,17 @@ static void myvcs_ls_files(Args* args);
 static void myvcs_write_tree(Args* args);
 
 // Helpers
-static Object myvcs_object_make(const char* type, const char* file_path);
-static void myvcs_object_write(const char hash_str[41], Object object);
+static Object myvcs_object_from_file(const char* type, const char* file_path);
+static void myvcs_object_write(const char hex[41], Object object);
 static bool myvcs_object_check_type(const char* type);
 static Index myvcs_index_read(void);
 static void myvcs_index_add(Index* index, IndexEntry entry);
 static int myvcs_index_entry_compare(const void* a, const void* b);
 static void myvcs_index_write(Index index);
 static uint32_t mode_from_state(mode_t mode);
-static TreeNode* myvcs_build_tree(Index index, size_t start, size_t end, size_t prefix_len);
+static TreeNode* myvcs_tree_build(Index index, size_t start, size_t end, size_t prefix_len);
+static void myvcs_tree_write(TreeNode* root);
+static void myvcs_tree_print(Object object, FILE* f);
 
 // Zlib helpers
 static Buffer zlib_compress(size_t size, const void* data);
@@ -187,19 +190,19 @@ void myvcs_hash_objects(Args* args) {
 
 	for (int i = 0; i < file_count; ++i) {
 		const char* file_path = file_paths[i];
-		Object object = myvcs_object_make(type, file_path);
+		Object object = myvcs_object_from_file(type, file_path);
 
 		uint8_t hash[20];
 		sha1(object.size, object.data, hash);
 
-		char hash_str[41];
-		hash_to_string(hash, hash_str);
+		char hex[41];
+		hash_to_string(hash, hex);
 
 		if (write) {
-			myvcs_object_write(hash_str, object);
+			myvcs_object_write(hex, object);
 		}
 
-		fprintf(stdout, "%s\n", hash_str);
+		fprintf(stdout, "%s\n", hex);
 
 		free(object.data);
 	}
@@ -286,17 +289,23 @@ void myvcs_cat_file(Args* args) {
 		exit(1);
 	}
 
+	size_t type_len = space - header;
+
 	switch (cat_op) {
 	case CAT_OP_TYPE:
-		fwrite(header, 1, space - header, stdout);
+		fwrite(header, type_len, 1, stdout);
 		fputc('\n', stdout);
 		break;
 	case CAT_OP_SIZE:
 		fprintf(stdout, "%zu\n", content_len);
 		break;
 	case CAT_OP_PRINT:
-		// pretty print on differnt
-		fwrite(content, 1, content_len, stdout);
+		if (type_len == 4 && memcmp(header, "tree", 4) == 0) { // Pretty print tree
+			Object tree = {"tree", content_len, content};
+			myvcs_tree_print(tree, stdout);
+		} else {
+			fwrite(content, 1, content_len, stdout);
+		}
 		break;
 	case CAT_OP_NONE:
 		break;
@@ -313,7 +322,7 @@ void myvcs_add_file(Args* args) {
 	while ((arg = args_next(args)) != NULL) {
 		if (arg[0] == '-') {
 			fprintf(stderr, "error: unsupported flag '%s'\n", arg);
-		    exit(1);
+			exit(1);
 		}
 		file_paths[file_count++] = arg;
 	}
@@ -335,9 +344,9 @@ void myvcs_add_file(Args* args) {
 		}
 		fprintf(stderr, "myvcs: normalised path: %s\n", normal_path);
 
-	    size_t db_directory_len = sizeof(DATABASE_DIRECTORY)-1;
-	    if (strncmp(normal_path, DATABASE_DIRECTORY, db_directory_len) == 0 &&
-           (normal_path[db_directory_len] == '\0' || normal_path[db_directory_len] == '/')) {
+		size_t db_directory_len = sizeof(DATABASE_DIRECTORY)-1;
+		if (strncmp(normal_path, DATABASE_DIRECTORY, db_directory_len) == 0 &&
+		        (normal_path[db_directory_len] == '\0' || normal_path[db_directory_len] == '/')) {
 			fprintf(stderr, "error: cannot add files from '" DATABASE_DIRECTORY "'\n");
 			exit(1);
 		}
@@ -348,25 +357,25 @@ void myvcs_add_file(Args* args) {
 			exit(1);
 		}
 
-		const Object object = myvcs_object_make("blob", normal_path);
+		const Object object = myvcs_object_from_file("blob", normal_path);
 
 		uint8_t hash[20];
 		sha1(object.size, object.data, hash);
 
-		char hash_str[41];
-		hash_to_string(hash, hash_str);
+		char hex[41];
+		hash_to_string(hash, hex);
 
-		fprintf(stderr, "myvcs: adding file: %s %s\n", normal_path, hash_str);
+		fprintf(stderr, "myvcs: adding file: %s %s\n", normal_path, hex);
 
-		myvcs_object_write(hash_str, object);
+		myvcs_object_write(hex, object);
 
 		IndexEntry entry;
 
-	    struct stat file_stat;
-	    if (stat(normal_path, &file_stat) != 0) {
-	        fprintf(stderr, "error: file '%s' does not exist\n", file_path);
-	        exit(1);
-	    }
+		struct stat file_stat;
+		if (stat(normal_path, &file_stat) != 0) {
+			fprintf(stderr, "error: file '%s' does not exist\n", file_path);
+			exit(1);
+		}
 
 		entry.ctime_s = file_stat.st_ctimespec.tv_sec;
 		entry.ctime_ns = file_stat.st_ctimespec.tv_nsec;
@@ -432,18 +441,15 @@ void myvcs_write_tree(Args* args) {
 	(void)args;
 
 	Index index = myvcs_index_read();
-	TreeNode* root = myvcs_build_tree(index, 0, index.count, 0);
+	TreeNode* root = myvcs_tree_build(index, 0, index.count, 0);
 
-    char hash_str[41];
-    hash_to_string(root->hash, hash_str);
-    fprintf(stderr, "myvcs: writing tree: %s\n", hash_str);
-
-    myvcs_object_write(hash_str, root->object);
+	myvcs_tree_write(root);
 }
 
 // Helpers
 
-Object myvcs_object_make(const char* type, const char* file_path) {
+// Rename
+Object myvcs_object_from_file(const char* type, const char* file_path) {
 	struct stat file_stat;
 	if (stat(file_path, &file_stat) != 0) {
 		fprintf(stderr, "error: file '%s' does not exist\n", file_path);
@@ -474,7 +480,7 @@ Object myvcs_object_make(const char* type, const char* file_path) {
 	};
 }
 
-void myvcs_object_write(const char hash_str[41], Object object) {
+void myvcs_object_write(const char hex[41], Object object) {
 	if (!folder_exists(DATABASE_DIRECTORY)) {
 		fprintf(stderr, "error: not a repository\n");
 		exit(1);
@@ -486,10 +492,10 @@ void myvcs_object_write(const char hash_str[41], Object object) {
 	}
 
 	char path[OBJECT_PATH_LENGTH];
-	snprintf(path, sizeof(path), DATABASE_DIRECTORY "/objects/%c%c", hash_str[0], hash_str[1]);
+	snprintf(path, sizeof(path), DATABASE_DIRECTORY "/objects/%c%c", hex[0], hex[1]);
 	mkdir(path, 0777);
 
-	snprintf(path, sizeof(path), DATABASE_DIRECTORY "/objects/%c%c/%s", hash_str[0], hash_str[1], hash_str+2);
+	snprintf(path, sizeof(path), DATABASE_DIRECTORY "/objects/%c%c/%s", hex[0], hex[1], hex+2);
 
 	if (!file_exists(path)) {
 		fprintf(stderr, "myvcs: writing %s to %s\n", object.type, path);
@@ -616,13 +622,13 @@ Index myvcs_index_read(void) {
 		fseek(f, (long)padding, SEEK_CUR);
 	}
 
-	uint8_t hash[20];
-	fread(hash, 20, 1, f);
+	// Reading hash
+	fread(index.hash, 20, 1, f);
 
-	char hash_str[41];
-	hash_to_string(hash, hash_str);
+	char hex[41];
+	hash_to_string(index.hash, hex);
 
-	fprintf(stderr, "myvcs: index hash: %s\n", hash_str);
+	fprintf(stderr, "myvcs: index hash: %s\n", hex);
 
 	// TODO: verify checksum
 
@@ -783,90 +789,138 @@ uint32_t mode_from_state(mode_t mode) {
 	return 0;
 }
 
-TreeNode* myvcs_build_tree(Index index, size_t start, size_t end, size_t prefix_len) {
+TreeNode* myvcs_tree_build(Index index, size_t start, size_t end, size_t prefix_len) {
 	TreeNode* root = malloc(sizeof(TreeNode));
 	if (root == NULL) {
 		fprintf(stderr, "error: could not allocate tree\n");
 		return NULL;
 	}
-    memset(root, 0, sizeof(TreeNode));
+	memset(root, 0, sizeof(TreeNode));
 
-    size_t tree_size = 0;
+	size_t tree_size = 0;
 	size_t current = start;
 
 	while (current < end) {
 		const IndexEntry entry = index.entries[current];
-	    const char* path = entry.path + prefix_len;
-	    const char* slash = strchr(path, '/');
+		const char* path = entry.path + prefix_len;
+		const char* slash = strchr(path, '/');
 
 		if (slash == NULL) { // File in this directory
-		    TreeNode* leaf = malloc(sizeof(TreeNode));
-		    if (leaf == NULL) {
-		        fprintf(stderr, "error: could not allocate tree\n");
-		        return NULL;
-		    }
-		    memset(leaf, 0, sizeof(TreeNode));
+			TreeNode* leaf = malloc(sizeof(TreeNode));
+			if (leaf == NULL) {
+				fprintf(stderr, "error: could not allocate tree\n");
+				return NULL;
+			}
+			memset(leaf, 0, sizeof(TreeNode));
 
-		    leaf->name = path;
-		    leaf->name_length = strlen(leaf->name);
-		    leaf->mode = entry.mode;
-		    memcpy(leaf->hash, entry.hash, 20);
-		    array_append(&root->children, leaf);
+			leaf->name = path;
+			leaf->name_length = strlen(leaf->name);
+			leaf->mode = entry.mode;
+			memcpy(leaf->hash, entry.hash, 20);
+			array_append(&root->children, leaf);
 
-		    tree_size += snprintf(NULL, 0, "%o %.*s", entry.mode, (int)leaf->name_length, leaf->name) + 1;
-		    tree_size += 20;
+			tree_size += snprintf(NULL, 0, "%o %.*s", entry.mode, (int)leaf->name_length, leaf->name) + 1;
+			tree_size += 20;
 
-		    current++;
+			current++;
 		} else { // File subdirectory
 
-		    // Finding all files of this folder
-            size_t dir_len = slash - path;
-            size_t j = current+1;
-		    while (j < end) {
-		        const char* sub_entry = index.entries[j].path + prefix_len;
-		        if (strncmp(sub_entry, path, dir_len) != 0 || sub_entry[dir_len] != '/') break;
-		        j++;
-		    }
+			// Finding all files of this folder
+			size_t dir_len = slash - path;
+			size_t j = current+1;
+			while (j < end) {
+				const char* sub_entry = index.entries[j].path + prefix_len;
+				if (strncmp(sub_entry, path, dir_len) != 0 || sub_entry[dir_len] != '/') break;
+				j++;
+			}
 
-		    TreeNode* child_tree = myvcs_build_tree(index, current, j, prefix_len + dir_len + 1);
-		    child_tree->name = path;
-		    child_tree->name_length = dir_len;
-		    child_tree->mode = FILE_MODE_DIRECTORY;
-		    array_append(&root->children, child_tree);
+			TreeNode* child_tree = myvcs_tree_build(index, current, j, prefix_len + dir_len + 1);
+			child_tree->name = path;
+			child_tree->name_length = dir_len;
+			child_tree->mode = FILE_MODE_DIRECTORY;
+			array_append(&root->children, child_tree);
 
-		    tree_size += snprintf(NULL, 0, "%o %.*s", child_tree->mode, (int)child_tree->name_length, child_tree->name) + 1;
-		    tree_size += 20;
+			tree_size += snprintf(NULL, 0, "%o %.*s", child_tree->mode, (int)child_tree->name_length, child_tree->name) + 1;
+			tree_size += 20;
 
-		    current = j;
+			current = j;
 		}
 	}
-    root->size = tree_size;
+	root->size = tree_size;
 
-    // Creating Tree Object
-    size_t header_size = snprintf(NULL, 0, "tree %zu", tree_size);
-    size_t object_size = header_size + tree_size + 1;
+	// Creating Tree Object
+	size_t header_size = snprintf(NULL, 0, "tree %zu", tree_size);
+	size_t object_size = header_size + tree_size + 1;
 
-    uint8_t* object_data = malloc(object_size);
-    if (object_data == NULL) {
-        fprintf(stderr, "error: could not allocate buffer\n");
-        exit(1);
-    }
+	uint8_t* object_data = malloc(object_size);
+	if (object_data == NULL) {
+		fprintf(stderr, "error: could not allocate buffer\n");
+		exit(1);
+	}
 
-    snprintf((char*)object_data, object_size,  "tree %zu", tree_size);
+	snprintf((char*)object_data, object_size,  "tree %zu", tree_size);
 
-    size_t offset = header_size + 1;
-    for (size_t i = 0; i < root->children.length; i++) {
-        const TreeNode* node = root->children.items[i];
-        size_t n = snprintf((char*)object_data + offset, object_size, "%o %.*s", node->mode, (int)node->name_length, node->name);
-        offset += n+1;
-        memcpy(object_data + offset, node->hash, 20);
-        offset += 20;
-    }
-    root->object = (Object) {"tree", object_size, object_data};
+	size_t offset = header_size + 1;
+	for (size_t i = 0; i < root->children.length; i++) {
+		const TreeNode* node = root->children.items[i];
+		size_t n = snprintf((char*)object_data + offset, object_size, "%o %.*s", node->mode, (int)node->name_length, node->name);
+		offset += n+1;
+		memcpy(object_data + offset, node->hash, 20);
+		offset += 20;
+	}
 
-    sha1(object_size, object_data, root->hash);
+	root->object = (Object) {
+		"tree", object_size, object_data
+	};
+
+	sha1(object_size, object_data, root->hash);
 
 	return root;
+}
+
+void myvcs_tree_write(TreeNode* root) {
+	assert(root != NULL);
+
+	for (size_t i = 0; i < root->children.length; i++) {
+		TreeNode* node = root->children.items[i];
+		if (node->mode == FILE_MODE_DIRECTORY) myvcs_tree_write(node);
+	}
+	char hex[41];
+	hash_to_string(root->hash, hex);
+
+	fprintf(stderr, "myvcs: writing tree: %s\n", hex);
+	myvcs_object_write(hex, root->object);
+}
+
+void myvcs_tree_print(Object object, FILE* f) {
+	assert(memcmp(object.type, "tree", 4) == 0);
+
+	size_t offset = 0;
+	while (offset < object.size) {
+		const char* space = memchr(object.data + offset, ' ', object.size - offset);
+		if (space == NULL) {
+			fprintf(stderr, "error: corrupted object\n");
+			exit(1);
+		}
+		const uint32_t mode = strtoul((char*)object.data + offset, NULL, 8);
+
+		const char* name = space + 1;
+		const char* nul = memchr(name, '\0', object.size);
+		if (nul == NULL || (size_t)((object.data + object.size) - ((uint8_t*)nul + 1)) < 20) {
+			fprintf(stderr, "error: corrupted object\n");
+			exit(1);
+		}
+
+		const uint8_t* hash = (uint8_t*)nul + 1;
+		char hex[41];
+		hash_to_string(hash, hex);
+
+		const char* type = (mode == FILE_MODE_DIRECTORY) ? "tree"
+		                   : (mode == FILE_MODE_SUBMODULE) ? "commit" : "blob";
+		fprintf(f, "%06o %s %s\t%.*s\n", mode, type, hex, (int)(nul - name), name);
+
+		offset = (hash + 20) - object.data;
+	}
 }
 
 Buffer zlib_compress(size_t size, const void* data) {

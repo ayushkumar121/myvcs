@@ -11,12 +11,13 @@ static inline uint32_t rotate_left(uint32_t x, int n) {
 // copied from https://en.wikipedia.org/wiki/SHA-1
 void sha1(uint64_t n, const uint8_t* message, uint8_t hash[20]) {
 	assert(hash != NULL);
+	assert(message != NULL);
 
 	// Pre-Processing
 	uint64_t ml = n*8;
 	size_t buffer_size = ((n + 9 + 63) / 64) * 64; // ceil((n + 9) / 64) × 64
 	uint8_t* buffer = malloc(buffer_size);
-    assert(buffer != NULL);
+	assert(buffer != NULL);
 
 	memcpy(buffer, message, n);
 
