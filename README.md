@@ -14,7 +14,7 @@ with AI tools used for learning and researching.
 - [x] write-tree
 - [x] add
 - [x] commit
-- [ ] log
+- [x] log
 - [ ] checkout
 - [ ] status
 - [ ] merge
