@@ -515,6 +515,11 @@ void myvcs_commit(Args* args) {
                 exit(1);
             }
             parent_hex = ref_file.data;
+
+            if (memcmp(parent_hex, tree_hex, 41) != 0) {
+                fprintf(stderr, "error: nothing to commit\n");
+                exit(1);
+            }
         }
 
         // first ever commit
