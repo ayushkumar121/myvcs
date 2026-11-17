@@ -3,6 +3,8 @@
 
 #include <stdio.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <assert.h>
 
 #define COUNT_OF(arr) (sizeof(arr)/sizeof(arr[0]))
 

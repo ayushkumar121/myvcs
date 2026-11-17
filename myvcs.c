@@ -80,6 +80,7 @@ static void myvcs_add_file(Args* args);
 static void myvcs_ls_files(Args* args);
 static void myvcs_write_tree(Args* args);
 static void myvcs_commit(Args* args);
+static void myvcs_log(Args* args);
 
 // Helpers
 static Object myvcs_object_load(const char hex[41]);
@@ -130,6 +131,8 @@ int main(int argc, char** argv) {
 		myvcs_write_tree(&args);
 	} else if (strcmp(subcommand, "commit") == 0) {
 	    myvcs_commit(&args);
+	} else if (strcmp(subcommand, "log") == 0) {
+	    myvcs_log(&args);
 	} else {
 		fprintf(stderr, "error: unknown subcommand %s\n", subcommand);
 		exit(1);
@@ -142,6 +145,8 @@ void myvcs_init(Args* args) {
 	(void)args;
 
 	if (folder_exists(DATABASE_DIRECTORY)) {
+	    fprintf(stderr, "error: repository already exists\n");
+	    exit(1);
 	}
 
 	if (mkdir(DATABASE_DIRECTORY, 0777) != 0 && errno != EEXIST) {
@@ -161,7 +166,7 @@ void myvcs_init(Args* args) {
 	fprintf(f, "ref: refs/heads/" MAIN_BRANCH_NAME "\n");
 	fclose(f);
 
-	fprintf(stderr, "myvcs: repository initialised\n");
+	fprintf(stdout, "repository initialised\n");
 }
 
 void myvcs_hash_objects(Args* args) {
@@ -319,7 +324,6 @@ void myvcs_add_file(Args* args) {
 			fprintf(stderr, "error: could not normalise path '%s'\n", file_path);
 			exit(1);
 		}
-		fprintf(stderr, "myvcs: normalised path: %s\n", normal_path);
 
 	    if (normal_path[0] == '/') {
 	        fprintf(stderr, "error: absolute paths are not supported\n");
@@ -335,7 +339,7 @@ void myvcs_add_file(Args* args) {
 
 		// TODO: implement recursive adding of files from folder
 		if (folder_exists(normal_path)) {
-			fprintf(stderr, "myvcs: adding folder is not supported\n");
+			fprintf(stderr, "error: adding folder is not supported\n");
 			exit(1);
 		}
 
@@ -346,8 +350,6 @@ void myvcs_add_file(Args* args) {
 
 		char hex[41];
 		hash_to_string(hash, hex);
-
-		fprintf(stderr, "myvcs: adding file: %s %s\n", normal_path, hex);
 
 		myvcs_object_write(hex, object);
 
@@ -468,7 +470,10 @@ void myvcs_commit(Args* args) {
     char tree_hex[41];
     hash_to_string(root->hash, tree_hex);
 
-    time_t timestamp = time(NULL);
+    time_t now = time(NULL);
+
+    char tz[6];
+    strftime(tz, sizeof(tz), "%z", localtime(&now));
 
     Buffer head_file = buffer_from_file(DATABASE_DIRECTORY "/HEAD");
     if (memcmp(head_file.data, "ref: ", 5) == 0) {
@@ -544,8 +549,11 @@ void myvcs_commit(Args* args) {
         char parent_line[64] = "";
         if (hash_parent) snprintf(parent_line, sizeof(parent_line), "parent %.*s\n", 40, parent_hash);
 
-        size_t n1 = snprintf(NULL, 0, "tree %s\n%sauthor %s <%s> %lld +0530\ncommitter %s <%s> %lld +0530\n\n%s\n",
-                             tree_hex, parent_line, author_name, author_email, (long long)timestamp, committer_name, committer_email, (long long)timestamp, message);
+        size_t n1 = snprintf(NULL, 0, "tree %s\n%sauthor %s <%s> %lld %s\ncommitter %s <%s> %lld %s\n\n%s\n",
+                             tree_hex, parent_line,
+                             author_name, author_email, (long long)now, tz,
+                             committer_name, committer_email, (long long)now, tz,
+                             message);
 
         size_t n2 = snprintf(NULL, 0, "commit %zu", n1);
 
@@ -558,8 +566,11 @@ void myvcs_commit(Args* args) {
 
         snprintf(commit_object_data, commit_object_size, "commit %zu", n1);
 
-        snprintf(commit_object_data+n2+1, commit_object_size, "tree %s\n%sauthor %s <%s> %lld +0530\ncommitter %s <%s> %lld +0530\n\n%s\n",
-                 tree_hex, parent_line, author_name, author_email, (long long)timestamp, committer_name, committer_email, (long long)timestamp, message);
+        snprintf(commit_object_data+n2+1, n1+1, "tree %s\n%sauthor %s <%s> %lld %s\ncommitter %s <%s> %lld %s\n\n%s\n",
+                 tree_hex, parent_line,
+                 author_name, author_email, (long long)now, tz,
+                 committer_name, committer_email, (long long)now, tz,
+                 message);
 
         uint8_t commit_hash[20];
         sha1(commit_object_size, (uint8_t*)commit_object_data, commit_hash);
@@ -585,8 +596,89 @@ void myvcs_commit(Args* args) {
 
     } else {
         fprintf(stderr, "error: in DETACHED state checkout to a branch to commit\n");
+        exit(1);
     }
     free(head_file.data);
+}
+
+void myvcs_log(Args* args) {
+    (void)args;
+
+    char commit_hash[41];
+
+    Buffer head_file = buffer_from_file(DATABASE_DIRECTORY "/HEAD");
+    if (memcmp(head_file.data, "ref: ", 5) == 0) {
+        const size_t db_dir_len = strlen(DATABASE_DIRECTORY);
+        const size_t ref_len = db_dir_len + 1 + head_file.size - 6;
+        char* ref = malloc(ref_len + 1);
+
+        memcpy(ref, DATABASE_DIRECTORY, db_dir_len);
+        ref[db_dir_len] = '/';
+        memcpy(ref + db_dir_len + 1, head_file.data + 5, head_file.size - 6);
+        ref[ref_len] = '\0';
+
+        // Open ref file
+        if (file_exists(ref)) {
+            Buffer ref_file = ref_file = buffer_from_file(ref);
+            if (ref_file.size != 41) {
+                fprintf(stderr, "error: corrupted ref\n");
+                exit(1);
+            }
+
+            // Find commit hash
+            memcpy(commit_hash, ref_file.data, 40);
+            commit_hash[40] = '\0';
+        } else {
+            // no commits yet
+            fprintf(stderr, "error: your current branch does not have any commits yet\n");
+            exit(0);
+        }
+    } else {
+        if (head_file.size != 41) {
+            fprintf(stderr, "error: corrupted head\n");
+            exit(1);
+        }
+
+        memcpy(commit_hash, head_file.data, 40);
+        commit_hash[40] = '\0';
+    }
+
+    while (true) {
+        Object commit_object = myvcs_object_load(commit_hash);
+        if (strcmp(commit_object.type, "commit") != 0) {
+            fprintf(stderr, "error: broken commit hash\n");
+            exit(1);
+        }
+
+        uint8_t* new_line = memchr(commit_object.data, '\n', commit_object.size);
+        if (new_line == NULL) {
+            fprintf(stderr, "error: corrupted commit\n");
+            exit(1);
+        }
+
+        fprintf(stdout, "commit %s\n", commit_hash);
+
+        bool hash_parent = false;
+        const uint8_t* end = commit_object.data + commit_object.size;
+        // 48 = "parent " + <hash> + <new_line>
+        if ((end - new_line) < 48) {
+            fprintf(stderr, "error: corrupted commit\n");
+            exit(1);
+        }
+
+        // copy new commit_hash into (nul byte should be already there)
+        if (memcmp(new_line+1, "parent", 6) == 0) {
+            hash_parent = true;
+            memcpy(commit_hash, new_line+8, 40);
+        }
+
+        uint8_t* commit_message = new_line+48;
+        fprintf(stdout, "%.*s", (int)(end-commit_message), (char*)commit_message);
+
+        if (!hash_parent) {
+            break;
+        }
+    }
 }
 
 // Helpers
@@ -608,8 +700,6 @@ Object myvcs_object_load(const char hex[41]) {
     char* header = uncompressed.data;
     uint8_t* content = uncompressed.data + header_size + 1;
     size_t content_len = uncompressed.size - header_size - 1;
-
-    fprintf(stderr, "myvcs: header: %s\n", (char*)header);
 
     char* space = memchr(header, ' ', header_size);
     if (space == NULL) {
@@ -676,7 +766,6 @@ void myvcs_object_write(const char hex[41], Object object) {
 	snprintf(path, sizeof(path), DATABASE_DIRECTORY "/objects/%c%c/%s", hex[0], hex[1], hex+2);
 
 	if (!file_exists(path)) {
-		fprintf(stderr, "myvcs: writing %s to %s\n", object.type, path);
 		Buffer compressed = zlib_compress(object.size, object.data);
 
 		FILE *f = fopen(path, "wb");
@@ -805,8 +894,6 @@ Index myvcs_index_read(void) {
 
 	char hex[41];
 	hash_to_string(index.hash, hex);
-
-	fprintf(stderr, "myvcs: index hash: %s\n", hex);
 
 	// TODO: verify checksum
 
@@ -1041,7 +1128,7 @@ TreeNode* myvcs_tree_build(Index index, size_t start, size_t end, size_t prefix_
 	size_t offset = header_size + 1;
 	for (size_t i = 0; i < root->children.length; i++) {
 		const TreeNode* node = root->children.items[i];
-		size_t n = snprintf((char*)object_data + offset, object_size, "%o %.*s", node->mode, (int)node->name_length, node->name);
+		size_t n = snprintf((char*)object_data + offset, object_size - offset, "%o %.*s", node->mode, (int)node->name_length, node->name);
 		offset += n+1;
 		memcpy(object_data + offset, node->hash, 20);
 		offset += 20;
@@ -1062,7 +1149,6 @@ void myvcs_tree_write(TreeNode* root) {
     char hex[41];
     hash_to_string(root->hash, hex);
 
-    fprintf(stderr, "myvcs: writing tree %s\n", hex);
     myvcs_object_write(hex, root->object);
 
 	for (size_t i = 0; i < root->children.length; i++) {
@@ -1083,9 +1169,10 @@ void myvcs_tree_print(Object object, FILE* f) {
 		}
 		const uint32_t mode = strtoul((char*)object.data + offset, NULL, 8);
 
+	    const uint8_t* end = object.data + object.size;
 		const char* name = space + 1;
-		const char* nul = memchr(name, '\0', object.size);
-		if (nul == NULL || (size_t)((object.data + object.size) - ((uint8_t*)nul + 1)) < 20) {
+		const char* nul = memchr(name, '\0', end - (uint8_t*)name);
+		if (nul == NULL || (size_t)(end - ((uint8_t*)nul + 1)) < 20) {
 			fprintf(stderr, "error: corrupted object\n");
 			exit(1);
 		}
@@ -1123,7 +1210,7 @@ char* myvcs_committer_name(void) {
     if (val != NULL) {
         return val;
     }
-    return getenv("MYVCS_COMMITTER_NAME");
+    return getenv("GIT_COMMITTER_NAME");
 }
 
 char* myvcs_committer_email(void) {
@@ -1131,12 +1218,10 @@ char* myvcs_committer_email(void) {
     if (val != NULL) {
         return val;
     }
-    return getenv("MYVCS_COMMITTER_EMAIL");
+    return getenv("GIT_COMMITTER_EMAIL");
 }
 
 Buffer zlib_compress(size_t size, const void* data) {
-	fprintf(stderr, "myvcs: compressing %zu\n", size);
-
 	size_t compressed_size = compressBound(size);
 	uint8_t* compressed_data = malloc(compressed_size);
 	if (compressed_data == NULL) {
@@ -1155,7 +1240,6 @@ Buffer zlib_compress(size_t size, const void* data) {
 }
 
 Buffer zlib_uncompress(size_t size, const void* data) {
-	fprintf(stderr, "myvcs: decompressing %zu\n", size);
 	size_t capacity = size * 4 + 64; // Initial guess
 
 	uint8_t* decompressed_data = malloc(capacity);
