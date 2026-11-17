@@ -522,7 +522,6 @@ void myvcs_commit(Args* args) {
             }
         }
 
-        // first ever commit
         const char* author_name = "Ayush";
         const char* author_email = "ayush@email.com";
 
