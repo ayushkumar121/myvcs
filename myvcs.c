@@ -82,7 +82,8 @@ static void myvcs_write_tree(Args* args);
 static void myvcs_commit(Args* args);
 
 // Helpers
-static Object myvcs_object_from_file(const char* type, const char* file_path);
+static Object myvcs_object_load(const char hex[41]);
+static Object myvcs_object_create_from_file(const char* type, const char* file_path);
 static void myvcs_object_write(const char hex[41], Object object);
 static bool myvcs_object_check_type(const char* type);
 static Index myvcs_index_read(void);
@@ -93,6 +94,10 @@ static uint32_t mode_from_state(mode_t mode);
 static TreeNode* myvcs_tree_build(Index index, size_t start, size_t end, size_t prefix_len);
 static void myvcs_tree_write(TreeNode* root);
 static void myvcs_tree_print(Object object, FILE* f);
+static char* myvcs_author_name(void);
+static char* myvcs_author_email(void);
+static char* myvcs_committer_name(void);
+static char* myvcs_committer_email(void);
 
 // Zlib helpers
 static Buffer zlib_compress(size_t size, const void* data);
@@ -194,7 +199,7 @@ void myvcs_hash_objects(Args* args) {
 
 	for (int i = 0; i < file_count; ++i) {
 		const char* file_path = file_paths[i];
-		Object object = myvcs_object_from_file(type, file_path);
+		Object object = myvcs_object_create_from_file(type, file_path);
 
 		uint8_t hash[20];
 		sha1(object.size, object.data, hash);
@@ -216,7 +221,7 @@ void myvcs_hash_objects(Args* args) {
 
 void myvcs_cat_file(Args* args) {
 	const char* arg;
-	const char* hash = NULL;
+	const char* hex = NULL;
 	enum {CAT_OP_NONE, CAT_OP_PRINT, CAT_OP_TYPE, CAT_OP_SIZE} cat_op = 0;
 
 	// Argument parsing
@@ -239,8 +244,8 @@ void myvcs_cat_file(Args* args) {
 			continue;
 		}
 
-		if (hash == NULL) {
-			hash = arg;
+		if (hex == NULL) {
+			hex = arg;
 		} else {
 			fprintf(stderr, "error: too many arguments\n");
 			exit(1);
@@ -252,63 +257,31 @@ void myvcs_cat_file(Args* args) {
 		exit(1);
 	}
 
-	if (hash == NULL) {
+	if (hex == NULL) {
 		fprintf(stderr, "error: hash not provided\n");
 		exit(1);
 	}
 
-	if (strlen(hash) != 40) {
+	if (strlen(hex) != 40) {
 		fprintf(stderr, "error: hash should be exactly 40 characters\n");
 		exit(1);
 	}
 
-	char path[OBJECT_PATH_LENGTH];
-	snprintf(path, sizeof(path), DATABASE_DIRECTORY "/objects/%c%c/%s", hash[0], hash[1], hash+2);
-
-	Buffer compressed = buffer_from_file(path);
-	Buffer uncompressed = zlib_uncompress(compressed.size, compressed.data);
-
-	uint8_t* header_end = memchr(uncompressed.data, '\0', uncompressed.size);
-	if (header_end == NULL) {
-		fprintf(stderr, "error: corrupted object\n");
-		exit(1);
-	}
-	size_t header_size = header_end - (uint8_t *)uncompressed.data;
-
-	char* header = uncompressed.data;
-	uint8_t* content = uncompressed.data + header_size + 1;
-	size_t content_len = uncompressed.size - header_size - 1;
-
-	fprintf(stderr, "myvcs: header: %s\n", (char*)header);
-
-	char* space = memchr(header, ' ', header_size);
-	if (space == NULL) {
-		fprintf(stderr, "error: corrupted header\n");
-		exit(1);
-	}
-
-	size_t declared = strtoull(space + 1, NULL, 10);
-	if (declared != content_len) {
-		fprintf(stderr, "error: corrupt object (size mismatch)\n");
-		exit(1);
-	}
-
-	size_t type_len = space - header;
+    Object object = myvcs_object_load(hex);
 
 	switch (cat_op) {
 	case CAT_OP_TYPE:
-		fwrite(header, type_len, 1, stdout);
-		fputc('\n', stdout);
+		fputs(object.type, stdout);
+	    fputc('\n', stdout);
 		break;
 	case CAT_OP_SIZE:
-		fprintf(stdout, "%zu\n", content_len);
+		fprintf(stdout, "%zu\n", object.size);
 		break;
 	case CAT_OP_PRINT:
-		if (type_len == 4 && memcmp(header, "tree", 4) == 0) { // Pretty print tree
-			Object tree = {"tree", content_len, content};
-			myvcs_tree_print(tree, stdout);
+		if (strcmp(object.type, "tree") == 0) { // Pretty print tree
+			myvcs_tree_print(object, stdout);
 		} else {
-			fwrite(content, 1, content_len, stdout);
+			fwrite(object.data, object.size, 1, stdout);
 		}
 		break;
 	case CAT_OP_NONE:
@@ -366,7 +339,7 @@ void myvcs_add_file(Args* args) {
 			exit(1);
 		}
 
-		const Object object = myvcs_object_from_file("blob", normal_path);
+		const Object object = myvcs_object_create_from_file("blob", normal_path);
 
 		uint8_t hash[20];
 		sha1(object.size, object.data, hash);
@@ -472,6 +445,9 @@ void myvcs_commit(Args* args) {
                 fprintf(stderr, "error: unsupported flag '%s'\n", arg);
                 exit(1);
             }
+        } else {
+            fprintf(stderr, "error: unexpected argument '%s'\n", arg);
+            exit(1);
         }
     }
 
@@ -505,31 +481,68 @@ void myvcs_commit(Args* args) {
         memcpy(ref + db_dir_len + 1, head_file.data + 5, head_file.size - 6);
         ref[ref_len] = '\0';
 
-        char* parent_hex = NULL;
+        Buffer ref_file = {0};
+        char parent_hash[41];
+        bool hash_parent = false;
 
         if (file_exists(ref)) {
+            hash_parent = true;
+
             // read parent commit
-            Buffer ref_file = buffer_from_file(ref);
+            ref_file = buffer_from_file(ref);
             if (ref_file.size != 41) {
-                fprintf(stderr, "error: corrupted ref");
+                fprintf(stderr, "error: corrupted ref\n");
                 exit(1);
             }
-            parent_hex = ref_file.data;
+            memcpy(parent_hash, ref_file.data, 40);
+            parent_hash[40] = '\0';
 
-            if (memcmp(parent_hex, tree_hex, 41) != 0) {
+            Object parent_commit_object = myvcs_object_load(parent_hash);
+            if (strcmp(parent_commit_object.type, "commit") != 0) {
+                fprintf(stderr, "error: ref stored unknown object\n");
+                exit(1);
+            }
+
+            uint8_t* space = memchr(parent_commit_object.data, ' ', parent_commit_object.size);
+            if (space == NULL) {
+                fprintf(stderr, "error: corrupted commit\n");
+                exit(1);
+            }
+
+            if (parent_commit_object.data + parent_commit_object.size - space < 41) {
+                fprintf(stderr, "error: corrupted commit\n");
+                exit(1);
+            }
+
+            char parent_tree_hex[41];
+            memcpy(parent_tree_hex, space+1, 40);
+            parent_tree_hex[40] = '\0';
+
+            if (memcmp(parent_tree_hex, tree_hex, 40) == 0) {
                 fprintf(stderr, "error: nothing to commit\n");
                 exit(1);
             }
         }
 
-        const char* author_name = "Ayush";
-        const char* author_email = "ayush@email.com";
+        const char* author_name = myvcs_author_name();
+        const char* author_email = myvcs_author_email();
 
-        const char* committer_name = "Ayush";
-        const char* committer_email = "ayush@email.com";
+        if (author_name == NULL || author_email == NULL) {
+            fprintf(stderr, "error: env MYVCS_AUTHOR_NAME and MYVCS_AUTHOR_EMAIL are required for commit\n");
+            exit(1);
+        }
+
+        const char* committer_name = myvcs_committer_name();
+        if (committer_name == NULL) {
+            committer_name = author_name;
+        }
+        const char* committer_email = myvcs_committer_email();
+        if (committer_email == NULL) {
+            committer_email = author_email;
+        }
 
         char parent_line[64] = "";
-        if (parent_hex != NULL) snprintf(parent_line, sizeof(parent_line), "parent %.*s\n", 40, parent_hex);
+        if (hash_parent) snprintf(parent_line, sizeof(parent_line), "parent %.*s\n", 40, parent_hash);
 
         size_t n1 = snprintf(NULL, 0, "tree %s\n%sauthor %s <%s> %lld +0530\ncommitter %s <%s> %lld +0530\n\n%s\n",
                              tree_hex, parent_line, author_name, author_email, (long long)timestamp, committer_name, committer_email, (long long)timestamp, message);
@@ -547,8 +560,6 @@ void myvcs_commit(Args* args) {
 
         snprintf(commit_object_data+n2+1, commit_object_size, "tree %s\n%sauthor %s <%s> %lld +0530\ncommitter %s <%s> %lld +0530\n\n%s\n",
                  tree_hex, parent_line, author_name, author_email, (long long)timestamp, committer_name, committer_email, (long long)timestamp, message);
-
-        fprintf(stderr, "commit message: \n%s\n", commit_object_data);
 
         uint8_t commit_hash[20];
         sha1(commit_object_size, (uint8_t*)commit_object_data, commit_hash);
@@ -569,16 +580,54 @@ void myvcs_commit(Args* args) {
         fprintf(f, "%s\n", commit_hex);
         fclose(f);
 
+        if (ref_file.data != NULL) free(ref_file.data);
         free(ref);
+
     } else {
         fprintf(stderr, "error: in DETACHED state checkout to a branch to commit\n");
     }
+    free(head_file.data);
 }
 
 // Helpers
 
-// Clear up semantics and rename
-Object myvcs_object_from_file(const char* type, const char* file_path) {
+Object myvcs_object_load(const char hex[41]) {
+    char path[OBJECT_PATH_LENGTH];
+    snprintf(path, sizeof(path), DATABASE_DIRECTORY "/objects/%c%c/%s", hex[0], hex[1], hex+2);
+
+    Buffer compressed = buffer_from_file(path);
+    Buffer uncompressed = zlib_uncompress(compressed.size, compressed.data);
+
+    uint8_t* header_end = memchr(uncompressed.data, '\0', uncompressed.size);
+    if (header_end == NULL) {
+        fprintf(stderr, "error: corrupted object\n");
+        exit(1);
+    }
+    size_t header_size = header_end - (uint8_t *)uncompressed.data;
+
+    char* header = uncompressed.data;
+    uint8_t* content = uncompressed.data + header_size + 1;
+    size_t content_len = uncompressed.size - header_size - 1;
+
+    fprintf(stderr, "myvcs: header: %s\n", (char*)header);
+
+    char* space = memchr(header, ' ', header_size);
+    if (space == NULL) {
+        fprintf(stderr, "error: corrupted header\n");
+        exit(1);
+    }
+
+    size_t declared = strtoull(space + 1, NULL, 10);
+    if (declared != content_len) {
+        fprintf(stderr, "error: corrupt object (size mismatch)\n");
+        exit(1);
+    }
+
+    char* type = strndup(header, space - header);
+    return (Object){type, content_len, content};
+}
+
+Object myvcs_object_create_from_file(const char* type, const char* file_path) {
 	struct stat file_stat;
 	if (stat(file_path, &file_stat) != 0) {
 		fprintf(stderr, "error: file '%s' does not exist\n", file_path);
@@ -1051,6 +1100,38 @@ void myvcs_tree_print(Object object, FILE* f) {
 
 		offset = (hash + 20) - object.data;
 	}
+}
+
+char* myvcs_author_name(void) {
+    char* val = getenv("MYVCS_AUTHOR_NAME");
+    if (val != NULL) {
+        return val;
+    }
+    return getenv("GIT_AUTHOR_NAME");
+}
+
+char* myvcs_author_email(void) {
+    char* val = getenv("MYVCS_AUTHOR_EMAIL");
+    if (val != NULL) {
+        return val;
+    }
+    return getenv("GIT_AUTHOR_EMAIL");
+}
+
+char* myvcs_committer_name(void) {
+    char* val = getenv("MYVCS_COMMITTER_NAME");
+    if (val != NULL) {
+        return val;
+    }
+    return getenv("MYVCS_COMMITTER_NAME");
+}
+
+char* myvcs_committer_email(void) {
+    char* val = getenv("MYVCS_COMMITTER_EMAIL");
+    if (val != NULL) {
+        return val;
+    }
+    return getenv("MYVCS_COMMITTER_EMAIL");
 }
 
 Buffer zlib_compress(size_t size, const void* data) {
