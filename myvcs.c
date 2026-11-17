@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <assert.h>
 #include <stdlib.h>
+#include <time.h>
 #include <zlib.h>
 #include <arpa/inet.h>
 
@@ -78,6 +79,7 @@ static void myvcs_cat_file(Args* args);
 static void myvcs_add_file(Args* args);
 static void myvcs_ls_files(Args* args);
 static void myvcs_write_tree(Args* args);
+static void myvcs_commit(Args* args);
 
 // Helpers
 static Object myvcs_object_from_file(const char* type, const char* file_path);
@@ -121,6 +123,8 @@ int main(int argc, char** argv) {
 		myvcs_ls_files(&args);
 	} else if (strcmp(subcommand, "write-tree") == 0) {
 		myvcs_write_tree(&args);
+	} else if (strcmp(subcommand, "commit") == 0) {
+	    myvcs_commit(&args);
 	} else {
 		fprintf(stderr, "error: unknown subcommand %s\n", subcommand);
 		exit(1);
@@ -344,6 +348,11 @@ void myvcs_add_file(Args* args) {
 		}
 		fprintf(stderr, "myvcs: normalised path: %s\n", normal_path);
 
+	    if (normal_path[0] == '/') {
+	        fprintf(stderr, "error: absolute paths are not supported\n");
+	        exit(1);
+	    }
+
 		size_t db_directory_len = sizeof(DATABASE_DIRECTORY)-1;
 		if (strncmp(normal_path, DATABASE_DIRECTORY, db_directory_len) == 0 &&
 		        (normal_path[db_directory_len] == '\0' || normal_path[db_directory_len] == '/')) {
@@ -441,14 +450,130 @@ void myvcs_write_tree(Args* args) {
 	(void)args;
 
 	Index index = myvcs_index_read();
-	TreeNode* root = myvcs_tree_build(index, 0, index.count, 0);
+    if (index.count > 0) {
+        TreeNode* root = myvcs_tree_build(index, 0, index.count, 0);
+        myvcs_tree_write(root);
+        char hex[41];
+        hash_to_string(root->hash, hex);
+        fprintf(stdout, "%s\n", hex);
+    }
+}
 
-	myvcs_tree_write(root);
+void myvcs_commit(Args* args) {
+    const char* arg;
+    const char* message = NULL;
+
+    // Argument parsing
+    while ((arg = args_next(args)) != NULL) {
+        if (arg[0] == '-') {
+            if (strcmp(arg, "-m") == 0) {
+                message = args_next(args);
+            } else {
+                fprintf(stderr, "error: unsupported flag '%s'\n", arg);
+                exit(1);
+            }
+        }
+    }
+
+    if (message == NULL) {
+        fprintf(stderr, "error: commit requires a message\n");
+        exit(1);
+    }
+
+    Index index = myvcs_index_read();
+    if (index.count == 0) {
+        fprintf(stderr, "error: nothing to commit\n");
+        exit(1);
+    }
+
+    TreeNode* root = myvcs_tree_build(index, 0, index.count, 0);
+    myvcs_tree_write(root);
+
+    char tree_hex[41];
+    hash_to_string(root->hash, tree_hex);
+
+    time_t timestamp = time(NULL);
+
+    Buffer head_file = buffer_from_file(DATABASE_DIRECTORY "/HEAD");
+    if (memcmp(head_file.data, "ref: ", 5) == 0) {
+        const size_t db_dir_len = strlen(DATABASE_DIRECTORY);
+        const size_t ref_len = db_dir_len + 1 + head_file.size - 6;
+        char* ref = malloc(ref_len + 1);
+
+        memcpy(ref, DATABASE_DIRECTORY, db_dir_len);
+        ref[db_dir_len] = '/';
+        memcpy(ref + db_dir_len + 1, head_file.data + 5, head_file.size - 6);
+        ref[ref_len] = '\0';
+
+        char* parent_hex = NULL;
+
+        if (file_exists(ref)) {
+            // read parent commit
+            Buffer ref_file = buffer_from_file(ref);
+            if (ref_file.size != 41) {
+                fprintf(stderr, "error: corrupted ref");
+                exit(1);
+            }
+            parent_hex = ref_file.data;
+        }
+
+        // first ever commit
+        const char* author_name = "Ayush";
+        const char* author_email = "ayush@email.com";
+
+        const char* committer_name = "Ayush";
+        const char* committer_email = "ayush@email.com";
+
+        char parent_line[64] = "";
+        if (parent_hex != NULL) snprintf(parent_line, sizeof(parent_line), "parent %.*s\n", 40, parent_hex);
+
+        size_t n1 = snprintf(NULL, 0, "tree %s\n%sauthor %s <%s> %lld +0530\ncommitter %s <%s> %lld +0530\n\n%s\n",
+                             tree_hex, parent_line, author_name, author_email, (long long)timestamp, committer_name, committer_email, (long long)timestamp, message);
+
+        size_t n2 = snprintf(NULL, 0, "commit %zu", n1);
+
+        size_t commit_object_size = n2+n1+1;
+        char* commit_object_data = malloc(commit_object_size+1);
+        if (commit_object_data == NULL) {
+            fprintf(stderr, "error: could not allocate memory for commit\n");
+            exit(1);
+        }
+
+        snprintf(commit_object_data, commit_object_size, "commit %zu", n1);
+
+        snprintf(commit_object_data+n2+1, commit_object_size, "tree %s\n%sauthor %s <%s> %lld +0530\ncommitter %s <%s> %lld +0530\n\n%s\n",
+                 tree_hex, parent_line, author_name, author_email, (long long)timestamp, committer_name, committer_email, (long long)timestamp, message);
+
+        fprintf(stderr, "commit message: \n%s\n", commit_object_data);
+
+        uint8_t commit_hash[20];
+        sha1(commit_object_size, (uint8_t*)commit_object_data, commit_hash);
+
+        Object commit_object = (Object){"commit", commit_object_size, (uint8_t*)commit_object_data};
+
+        char commit_hex[41];
+        hash_to_string(commit_hash, commit_hex);
+
+        myvcs_object_write(commit_hex, commit_object);
+        free(commit_object_data);
+
+        FILE* f = fopen(ref, "wb");
+        if (f == NULL) {
+            fprintf(stderr, "error: could not open '%s' for writing\n", ref);
+            exit(1);
+        }
+        fprintf(f, "%s\n", commit_hex);
+        fclose(f);
+
+        free(ref);
+    } else {
+        fprintf(stderr, "error: in DETACHED state checkout to a branch to commit\n");
+    }
 }
 
 // Helpers
 
-// Rename
+// Clear up semantics and rename
 Object myvcs_object_from_file(const char* type, const char* file_path) {
 	struct stat file_stat;
 	if (stat(file_path, &file_stat) != 0) {
@@ -881,15 +1006,16 @@ TreeNode* myvcs_tree_build(Index index, size_t start, size_t end, size_t prefix_
 void myvcs_tree_write(TreeNode* root) {
 	assert(root != NULL);
 
+    char hex[41];
+    hash_to_string(root->hash, hex);
+
+    fprintf(stderr, "myvcs: writing tree %s\n", hex);
+    myvcs_object_write(hex, root->object);
+
 	for (size_t i = 0; i < root->children.length; i++) {
 		TreeNode* node = root->children.items[i];
 		if (node->mode == FILE_MODE_DIRECTORY) myvcs_tree_write(node);
 	}
-	char hex[41];
-	hash_to_string(root->hash, hex);
-
-	fprintf(stderr, "myvcs: writing tree: %s\n", hex);
-	myvcs_object_write(hex, root->object);
 }
 
 void myvcs_tree_print(Object object, FILE* f) {
@@ -928,7 +1054,10 @@ Buffer zlib_compress(size_t size, const void* data) {
 
 	size_t compressed_size = compressBound(size);
 	uint8_t* compressed_data = malloc(compressed_size);
-	assert(compressed_data != NULL);
+	if (compressed_data == NULL) {
+	    fprintf(stderr, "error: could not allocate buffer\n");
+	    exit(1);
+	}
 
 	if (compress(compressed_data, &compressed_size, data, size) != Z_OK) {
 		fprintf(stderr, "error: compression failed\n");
@@ -945,7 +1074,10 @@ Buffer zlib_uncompress(size_t size, const void* data) {
 	size_t capacity = size * 4 + 64; // Initial guess
 
 	uint8_t* decompressed_data = malloc(capacity);
-	assert(decompressed_data != NULL);
+	if (decompressed_data == NULL) {
+	    fprintf(stderr, "error: could not allocate buffer\n");
+	    exit(1);
+	}
 
 	while (true) {
 		size_t decompressed_size = capacity;
