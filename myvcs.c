@@ -672,6 +672,7 @@ void myvcs_log(Args* args) {
             memcpy(commit_hash, new_line+8, 40);
         }
 
+        // TODO: proper commit parsing
         uint8_t* commit_message = new_line+48;
         size_t commit_message_len = end-commit_message;
 
