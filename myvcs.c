@@ -673,7 +673,9 @@ void myvcs_log(Args* args) {
         }
 
         uint8_t* commit_message = new_line+48;
-        fprintf(stdout, "%.*s", (int)(end-commit_message), (char*)commit_message);
+        size_t commit_message_len = end-commit_message;
+
+        fprintf(stdout, "%.*s", (int)commit_message_len, (char*)commit_message);
 
         if (!hash_parent) {
             break;
