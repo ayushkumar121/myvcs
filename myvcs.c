@@ -21,6 +21,7 @@ typedef struct {
 	const char* type;
 	size_t size;
 	uint8_t* data;
+    void* base; // this is what needs to be freed / malloced
 } Object;
 
 enum {
@@ -70,6 +71,11 @@ struct TreeNode {
 	Object object;
 };
 
+typedef struct {
+    size_t length;
+    const char* data;
+} Token;
+
 #define EMPTY_INDEX ((Index){.version = 2})
 
 // Commands
@@ -101,6 +107,7 @@ static char* myvcs_committer_name(void);
 static char* myvcs_committer_email(void);
 
 // Zlib helpers
+static Token token_parser_next(const char** message, size_t* length, char delim);
 static Buffer zlib_compress(size_t size, const void* data);
 static Buffer zlib_uncompress(size_t size, const void* data);
 
@@ -218,7 +225,7 @@ void myvcs_hash_objects(Args* args) {
 
 		fprintf(stdout, "%s\n", hex);
 
-		free(object.data);
+		free(object.base);
 	}
 
 	free(file_paths);
@@ -527,6 +534,8 @@ void myvcs_commit(Args* args) {
                 fprintf(stderr, "error: nothing to commit\n");
                 exit(1);
             }
+
+            free(parent_commit_object.base);
         }
 
         const char* author_name = myvcs_author_name();
@@ -575,7 +584,7 @@ void myvcs_commit(Args* args) {
         uint8_t commit_hash[20];
         sha1(commit_object_size, (uint8_t*)commit_object_data, commit_hash);
 
-        Object commit_object = (Object){"commit", commit_object_size, (uint8_t*)commit_object_data};
+        Object commit_object = (Object){"commit", commit_object_size, (uint8_t*)commit_object_data, commit_object_data};
 
         char commit_hex[41];
         hash_to_string(commit_hash, commit_hex);
@@ -644,44 +653,97 @@ void myvcs_log(Args* args) {
     }
 
     while (true) {
+        bool hash_parent = false;
         Object commit_object = myvcs_object_load(commit_hash);
         if (strcmp(commit_object.type, "commit") != 0) {
             fprintf(stderr, "error: broken commit hash\n");
             exit(1);
         }
 
-        uint8_t* new_line = memchr(commit_object.data, '\n', commit_object.size);
-        if (new_line == NULL) {
-            fprintf(stderr, "error: corrupted commit\n");
-            exit(1);
-        }
-
         fprintf(stdout, "commit %s\n", commit_hash);
 
-        bool hash_parent = false;
-        const uint8_t* end = commit_object.data + commit_object.size;
-        // 48 = "parent " + <hash> + <new_line>
-        if ((end - new_line) < 48) {
-            fprintf(stderr, "error: corrupted commit\n");
-            exit(1);
-        }
+        Token token;
+        const char* commit_message = (const char*)commit_object.data;
+        size_t commit_message_size = commit_object.size;
 
-        // copy new commit_hash into (nul byte should be already there)
-        if (memcmp(new_line+1, "parent", 6) == 0) {
+        // consume "tree" <tree_hash>\n
+        if (token_parser_next(&commit_message, &commit_message_size, '\n').length == 0) goto corrupt;
+
+        // next line
+        token = token_parser_next(&commit_message, &commit_message_size, '\n');
+        if (token.length == 0) goto corrupt;
+
+        const char* author_line;
+        size_t author_line_length;
+
+        if (memcmp(token.data, "parent", 6) == 0) {
             hash_parent = true;
-            memcpy(commit_hash, new_line+8, 40);
+
+            const char* space = memchr(token.data, ' ', token.length);
+            if (space == NULL)  goto corrupt;
+
+            memcpy(commit_hash, space+1, 40); // We have parent for next iteration
+
+            token = token_parser_next(&commit_message, &commit_message_size, '\n');
+            author_line = token.data;
+            author_line_length = token.length;
+        } else {
+            author_line = token.data;
+            author_line_length = token.length;
         }
 
-        // TODO: proper commit parsing
-        uint8_t* commit_message = new_line+48;
-        size_t commit_message_len = end-commit_message;
+        if (token_parser_next(&author_line, &author_line_length, ' ').length == 0) goto corrupt;
 
-        fprintf(stdout, "%.*s", (int)commit_message_len, (char*)commit_message);
+        token = token_parser_next(&author_line, &author_line_length, ' ');
+        if (token.length == 0) goto corrupt;
 
-        if (!hash_parent) {
-            break;
-        }
+        const char* author_name = token.data;
+        size_t author_name_length = token.length;
+
+        token = token_parser_next(&author_line, &author_line_length, ' ');
+        if (token.length == 0) goto corrupt;
+
+        const char* author_email = token.data;
+        size_t author_email_length = token.length;
+
+        fprintf(stdout, "Author: %.*s %.*s\n", (int)author_name_length, author_name, (int)author_email_length, author_email);
+
+        token = token_parser_next(&author_line, &author_line_length, ' ');
+        if (token.length == 0) goto corrupt;
+
+        const char* timestamp = token.data;
+        time_t commit_timestamp = strtoll(timestamp, NULL, 10);
+
+        char timestamp_formatted[50];
+        strftime(timestamp_formatted, sizeof(timestamp_formatted), "%a %b %d %H:%M:%S %Y", localtime(&commit_timestamp));
+
+        token = token_parser_next(&author_line, &author_line_length, '\n');
+        if (token.length == 0) goto corrupt;
+
+        const char* tz = token.data;
+        size_t tz_length = token.length;
+
+        fprintf(stdout, "Date:   %s %.*s\n", timestamp_formatted, (int)tz_length, tz);
+
+        // skipping commiter line
+        if (token_parser_next(&commit_message, &commit_message_size, '\n').length == 0) goto corrupt;
+
+        // empty line
+        token_parser_next(&commit_message, &commit_message_size, '\n');
+
+        // Rest of the message (excluding new line)
+        fprintf(stdout, "\n    %.*s\n", (int)commit_message_size-1, commit_message);
+
+        free(commit_object.base);
+        if (!hash_parent) break;
+        fputc('\n', stdout);
     }
+
+    return;
+
+corrupt:
+    fprintf(stderr, "error: incomplete commit message\n");
+    exit(1);
 }
 
 // Helpers
@@ -692,6 +754,7 @@ Object myvcs_object_load(const char hex[41]) {
 
     Buffer compressed = buffer_from_file(path);
     Buffer uncompressed = zlib_uncompress(compressed.size, compressed.data);
+    free(compressed.data);
 
     uint8_t* header_end = memchr(uncompressed.data, '\0', uncompressed.size);
     if (header_end == NULL) {
@@ -717,7 +780,7 @@ Object myvcs_object_load(const char hex[41]) {
     }
 
     char* type = strndup(header, space - header);
-    return (Object){type, content_len, content};
+    return (Object){type, content_len, content, uncompressed.data};
 }
 
 Object myvcs_object_create_from_file(const char* type, const char* file_path) {
@@ -747,7 +810,7 @@ Object myvcs_object_create_from_file(const char* type, const char* file_path) {
 	}
 
 	return (Object) {
-		type, object_size, object_data
+		type, object_size, object_data, object_data
 	};
 }
 
@@ -1138,7 +1201,7 @@ TreeNode* myvcs_tree_build(Index index, size_t start, size_t end, size_t prefix_
 	}
 
 	root->object = (Object) {
-		"tree", object_size, object_data
+		"tree", object_size, object_data, object_data
 	};
 
 	sha1(object_size, object_data, root->hash);
@@ -1222,6 +1285,29 @@ char* myvcs_committer_email(void) {
         return val;
     }
     return getenv("GIT_COMMITTER_EMAIL");
+}
+
+// Generic helpers
+
+Token token_parser_next(const char** message, size_t* length, char delim) {
+    assert(message != NULL);
+    assert(length != NULL);
+
+    const char* pos = memchr(*message, delim, *length);
+    if (pos == NULL) {
+        return (Token){*length, *message};
+    }
+
+    const Token token = (Token){pos - *message, *message};
+    const char* end = *message + *length;
+    if (end > pos + 1) {
+        *message = pos + 1;
+        *length = *length - (token.length+1);
+    } else {
+        *length = 0;
+    }
+
+    return token;
 }
 
 Buffer zlib_compress(size_t size, const void* data) {
